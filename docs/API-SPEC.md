@@ -1,0 +1,131 @@
+# API 명세서
+
+> FastAPI REST. PRD/ERD 기반. Base URL `/api`. JSON.
+> 인증: HttpOnly 세션 쿠키. write 요청은 CSRF 토큰 필요(NFR-S4).
+> 최종 갱신: 2026-07-08 · Status: pending approval
+
+---
+
+## 공통
+
+**인증:** 로그인 시 세션 쿠키(`HttpOnly`, `Secure`, `SameSite=Lax`) 발급.
+**CSRF:** 상태변경(POST/PATCH/DELETE)은 `X-CSRF-Token` 헤더 필수(GET `/api/auth/csrf`로 발급). *(approve 포함 — MUST)*
+**권한:** `admin`=관리 CRUD 전부, `reviewer`=매칭 조회/승인·전송.
+**에러 포맷:** `{ "detail": "message" }`, 표준 HTTP 코드(400/401/403/404/409/422).
+**⚠️ 토큰 배제:** SNS 계정 관련 어떤 응답에도 `encrypted_credentials`/원문 토큰이 **포함되지 않는다**(MUST-FIX #3).
+
+---
+
+## 인증
+
+### `POST /api/auth/login`
+Req `{ "email": "...", "password": "..." }` → 200 + 세션쿠키 `{ "id", "email", "role" }` · 401 실패.
+
+### `POST /api/auth/logout`
+200. 세션 무효화.
+
+### `GET /api/auth/me`
+200 `{ "id", "email", "role" }` · 401.
+
+### `GET /api/auth/csrf`
+200 `{ "csrf_token": "..." }`.
+
+---
+
+## 소스 (admin)
+
+### `GET /api/sources`
+200 `[{ id, type, config, poll_interval_sec, enabled, last_success_at, health_status, backoff_until }]`
+
+### `POST /api/sources`
+Req `{ type: "threads|naver_cafe|community", config: {...}, poll_interval_sec }` → 201 source.
+
+### `PATCH /api/sources/{id}`
+Req(부분) `{ enabled?, poll_interval_sec?, config? }` → 200.
+
+### `DELETE /api/sources/{id}` → 204.
+
+---
+
+## 키워드 (admin)
+
+### `GET /api/keywords` → 200 `[{ id, pattern, match_type, enabled, source_scope }]`
+### `POST /api/keywords`
+Req `{ pattern, match_type: "substring|regex", source_scope?: int|null }` → 201.
+422: regex 컴파일 실패 시.
+### `PATCH /api/keywords/{id}` · `DELETE /api/keywords/{id}`
+
+---
+
+## 템플릿 (admin)
+
+### `GET /api/templates` → 200 `[{ id, name, body, enabled }]`
+### `POST /api/templates` Req `{ name, body }` → 201.
+### `PATCH /api/templates/{id}` · `DELETE /api/templates/{id}`
+
+---
+
+## SNS 계정 (admin) — 토큰 배제
+
+### `GET /api/sns-accounts`
+200 `[{ id, platform, display_name, status, token_expires_at }]` — **암호문/토큰 필드 없음**.
+
+### `POST /api/sns-accounts`
+Req `{ platform, display_name, credentials: {...} }` → 201 `{ id, platform, display_name, status }`.
+→ `credentials`는 서버가 즉시 Fernet 암호화해 `sns_account_secrets`에 저장. 응답에 재노출 안 함.
+
+### `DELETE /api/sns-accounts/{id}` → 204 (secrets cascade).
+
+---
+
+## 매칭 (reviewer)
+
+### `GET /api/matches`
+Query: `status`(new|reviewing|sending|replied|ignored), `source_id`, `page`, `size`.
+200 `{ items: [{ id, source_id, external_post_id, author, url, content, matched_keyword_id, published_at, matched_at, status }], total }`
+
+### `GET /api/matches/{id}`
+200 매칭 상세 + `reply_actions` 이력 요약.
+
+### `POST /api/matches/{id}/approve` — 핵심 (CSRF 필수)
+Req `{ template_id?: int, final_body: string, sns_account_id?: int }`
+동작(MUST-FIX #1):
+1. CAS: `status IN('new','reviewing') → 'sending'`. **0행이면 409 Conflict**(이미 처리 중/완료).
+2. 소스 `can_write=true`: `adapter.send_reply` → 성공 `reply_actions(action='sent', external_reply_id)` + `matched_posts.status='replied'` → **200** `{ action:'sent', external_reply_id }`. 실패 → `reply_actions(action='failed', error)` + status 복귀 `reviewing` → **502** `{ action:'failed', detail }`.
+3. `can_write=false`(네이버/커뮤니티): 전송 안 함. `reply_actions(action='approved')` 기록 + status `replied` → **200** `{ action:'approved', clipboard_body }`(수동 복사용).
+- 멱등성: `reply_actions` partial unique(action='sent')로 DB가 이중 sent 차단. 재요청은 409.
+
+### `POST /api/matches/{id}/ignore` (CSRF)
+→ `matched_posts.status='ignored'` → 200.
+
+### `POST /api/matches/{id}/retry` (CSRF)
+전송 실패건 수동 재시도(FR-13). status가 `reviewing`이어야 함 → approve와 동일 CAS 경로 재실행. 새 `reply_actions` 행.
+
+---
+
+## 감사 로그 (reviewer/admin)
+
+### `GET /api/reply-actions?match_id=...`
+200 `[{ id, matched_post_id, reviewer_user_id, action, external_reply_id, error, created_at }]` (append-only).
+
+---
+
+## 헬스
+
+### `GET /api/health`
+200 `{ status: "ok|degraded", db: "ok|error:...", poller: { last_tick, sources: [{ source_id, health_status, last_success_at }] } }`
+> M0 현재: `{ status, db }`만. poller 필드는 M1에서 추가.
+
+---
+
+## 상태코드 규약
+
+| 코드 | 의미 |
+|---|---|
+| 200/201/204 | 성공 |
+| 400/422 | 잘못된 입력(422=검증 실패, 예: regex) |
+| 401 | 미인증 |
+| 403 | 권한 부족 / CSRF 실패 |
+| 404 | 리소스 없음 |
+| **409** | **approve 경쟁(CAS 0행) — 이미 처리 중/완료** |
+| 502 | 외부 SNS 전송 실패 |

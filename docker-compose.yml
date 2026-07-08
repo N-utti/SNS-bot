@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sns
+      POSTGRES_PASSWORD: sns
+      POSTGRES_DB: sns
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 호스트 5432 충돌 회피: 로컬 psql은 5433 사용. api는 네트워크 내부 5432로 접속.
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sns -d sns"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://sns:sns@db:5432/sns
+      APP_ENV: dev
+    volumes:
+      # dev: 호스트 코드 마운트 → 코드/마이그레이션이 호스트에 반영됨
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    environment:
+      VITE_PROXY_TARGET: http://api:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules  # 호스트 빈 node_modules 가 컨테이너 설치본을 가리지 않게
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
